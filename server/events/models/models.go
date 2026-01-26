@@ -390,6 +390,8 @@ type PlanSuccess struct {
 	// branch we're merging into had been updated, and we had to merge again
 	// before planning
 	MergedAgain bool
+	// PlanJSON is the JSON output from terraform show -json (if show step was run)
+	PlanJSON string
 }
 
 type PolicySetResult struct {

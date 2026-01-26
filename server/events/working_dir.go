@@ -181,6 +181,11 @@ func (w *FileWorkspace) recheckDiverged(logger logging.SimpleLogging, p models.P
 		return false
 	}
 
+	// For branch mode (PR=0), divergence checks don't apply since there's no PR to merge
+	if p.Num == 0 {
+		return false
+	}
+
 	// Bring our remote refs up to date.
 	// Reset the URL in case we are using github app credentials since these might have
 	// expired and refreshed and the URL would now be different.
@@ -219,6 +224,20 @@ func (w *FileWorkspace) HasDiverged(logger logging.SimpleLogging, cloneDir strin
 		return false
 	}
 
+	// For branch mode (PR=0), divergence checks don't apply since there's no PR to merge
+	// Extract PR number from cloneDir path: .../repos/<owner>/<repo>/<PRNum>/<workspace>
+	pathParts := strings.Split(filepath.Clean(cloneDir), string(filepath.Separator))
+	for i := len(pathParts) - 1; i >= 0; i-- {
+		if pathParts[i] == workingDirPrefix && i+3 < len(pathParts) {
+			// PR number is 3 positions after "repos": repos/<owner>/<repo>/<PRNum>
+			if prNum, err := strconv.Atoi(pathParts[i+3]); err == nil && prNum == 0 {
+				// PR=0 means branch mode, no divergence check needed
+				return false
+			}
+			break
+		}
+	}
+
 	statusFetchCmd := exec.Command("git", "fetch")
 	statusFetchCmd.Dir = cloneDir
 	outputStatusFetch, err := statusFetchCmd.CombinedOutput()
@@ -247,7 +266,18 @@ func (w *FileWorkspace) updateToRef(logger logging.SimpleLogging, c wrappedGitCo
 	}
 
 	// For branch strategy it's easy: just *go to* the ref we're supposed to be at.
-	if !w.CheckoutMerge {
+	// Also treat API-triggered branch mode (PR=0) as branch strategy since there's no PR to merge.
+	if !w.CheckoutMerge || c.pr.Num == 0 {
+		// For branch mode (PR=0), fetch the branch and reset to FETCH_HEAD
+		// This works even with --single-branch clones where origin/<branch> refs don't exist
+		if c.pr.Num == 0 {
+			// Fetch the specific branch
+			if err := w.wrappedGit(logger, c, "fetch", "origin", c.pr.HeadBranch); err != nil {
+				return err
+			}
+			// Reset to what we just fetched
+			return w.wrappedGit(logger, c, "reset", "--hard", "FETCH_HEAD")
+		}
 		return w.wrappedGit(logger, c, "reset", "--hard", targetRef)
 	}
 
@@ -326,7 +356,8 @@ func (w *FileWorkspace) forceClone(logger logging.SimpleLogging, c wrappedGitCon
 	}
 
 	// if branch strategy, use depth=1
-	if !w.CheckoutMerge {
+	// Also treat API-triggered branch mode (PR=0) as branch strategy since there's no PR to merge.
+	if !w.CheckoutMerge || c.pr.Num == 0 {
 		return w.wrappedGit(logger, c, "clone", "--depth=1", "--branch", c.pr.HeadBranch, "--single-branch", headCloneURL, c.dir)
 	}
 
@@ -358,7 +389,18 @@ func (w *FileWorkspace) forceClone(logger logging.SimpleLogging, c wrappedGitCon
 // There is a new upstream update that we need, and we want to update to it
 // without deleting any existing plans
 func (w *FileWorkspace) mergeAgain(logger logging.SimpleLogging, c wrappedGitContext) error {
-	// Reset branch as if it was cloned again
+	// For branch mode (PR=0), we need to handle differently since refs/remotes/origin/<branch>
+	// doesn't exist in single-branch clones
+	if c.pr.Num == 0 {
+		// Fetch the latest from the branch
+		if err := w.wrappedGit(logger, c, "fetch", "origin", c.pr.HeadBranch); err != nil {
+			return err
+		}
+		// Reset to what we just fetched
+		return w.wrappedGit(logger, c, "reset", "--hard", "FETCH_HEAD")
+	}
+
+	// For PR mode, reset branch as if it was cloned again
 	if err := w.wrappedGit(logger, c, "reset", "--hard", fmt.Sprintf("refs/remotes/origin/%s", c.pr.BaseBranch)); err != nil {
 		return err
 	}

@@ -115,6 +115,8 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// TODO(MVP): Unlock logic for PR=0 (branch mode) needs proper implementation
+	// Currently using PR number as lock key; branch mode should use branch-based locking
 	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 	if result.HasErrors() {
 		code = http.StatusInternalServerError
@@ -150,6 +152,8 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// TODO(MVP): Unlock logic for PR=0 (branch mode) needs proper implementation
+	// Currently using PR number as lock key; branch mode should use branch-based locking
 	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 
 	// We can now prepare and run the apply step
@@ -264,7 +268,8 @@ func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (*com
 	if len(cmds) == 0 {
 		ctx.Log.Info("determined there was no project to run plan in")
 		// When silence is enabled and no projects are found, don't set any VCS status
-		if !a.SilenceVCSStatusNoProjects {
+		// Skip VCS status updates for branch mode (PR=0)
+		if !a.SilenceVCSStatusNoProjects && ctx.Pull.Num > 0 {
 			ctx.Log.Debug("setting VCS status to success with no projects found")
 			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Plan, 0, 0); err != nil {
 				ctx.Log.Warn("unable to update plan status: %s", err)
@@ -276,14 +281,17 @@ func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (*com
 				ctx.Log.Warn("unable to update apply status: %s", err)
 			}
 		} else {
-			ctx.Log.Debug("silence enabled and no projects found - not setting any VCS status")
+			ctx.Log.Debug("silence enabled or branch mode (PR=0) - not setting any VCS status")
 		}
 		return &command.Result{ProjectResults: []command.ProjectResult{}}, nil
 	}
 
 	// Update the combined plan commit status to pending
-	if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Plan); err != nil {
-		ctx.Log.Warn("unable to update plan commit status: %s", err)
+	// Skip VCS status updates for branch mode (PR=0)
+	if ctx.Pull.Num > 0 {
+		if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Plan); err != nil {
+			ctx.Log.Warn("unable to update plan commit status: %s", err)
+		}
 	}
 
 	var projectResults []command.ProjectResult
@@ -329,7 +337,8 @@ func (a *APIController) apiApply(request *APIRequest, ctx *command.Context) (*co
 	if len(cmds) == 0 {
 		ctx.Log.Info("determined there was no project to run apply in")
 		// When silence is enabled and no projects are found, don't set any VCS status
-		if !a.SilenceVCSStatusNoProjects {
+		// Skip VCS status updates for branch mode (PR=0)
+		if !a.SilenceVCSStatusNoProjects && ctx.Pull.Num > 0 {
 			ctx.Log.Debug("setting VCS status to success with no projects found")
 			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Plan, 0, 0); err != nil {
 				ctx.Log.Warn("unable to update plan status: %s", err)
@@ -341,14 +350,17 @@ func (a *APIController) apiApply(request *APIRequest, ctx *command.Context) (*co
 				ctx.Log.Warn("unable to update apply status: %s", err)
 			}
 		} else {
-			ctx.Log.Debug("silence enabled and no projects found - not setting any VCS status")
+			ctx.Log.Debug("silence enabled or branch mode (PR=0) - not setting any VCS status")
 		}
 		return &command.Result{ProjectResults: []command.ProjectResult{}}, nil
 	}
 
 	// Update the combined apply commit status to pending
-	if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Apply); err != nil {
-		ctx.Log.Warn("unable to update apply commit status: %s", err)
+	// Skip VCS status updates for branch mode (PR=0)
+	if ctx.Pull.Num > 0 {
+		if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Apply); err != nil {
+			ctx.Log.Warn("unable to update apply commit status: %s", err)
+		}
 	}
 
 	var projectResults []command.ProjectResult
@@ -413,13 +425,27 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 		return nil, nil, http.StatusForbidden, fmt.Errorf("repo not allowlisted")
 	}
 
+	// When PR is 0 or not provided, we're in "branch mode" - planning directly on a branch
+	// without a pull request. Use Ref for both head and base, and resolve commit SHA.
+	// TODO(MVP): This is a temporary solution using PR=0 as a sentinel value.
+	// Consider refactoring to explicit branch mode in the future.
+	pullNum := request.PR
+	headCommit := request.Ref
+	if pullNum == 0 {
+		a.Logger.Info("Branch mode detected (PR=0), resolving commit SHA for ref: %s", request.Ref)
+		// Attempt to resolve the ref to a commit SHA via VCS API
+		// For MVP, we'll use the ref as-is and let git resolve it during clone
+		// In production, you may want to call VCS API to get the actual commit SHA
+		headCommit = request.Ref
+	}
+
 	return &request, &command.Context{
 		HeadRepo: baseRepo,
 		Pull: models.PullRequest{
-			Num:        request.PR,
+			Num:        pullNum,
 			BaseBranch: request.Ref,
 			HeadBranch: request.Ref,
-			HeadCommit: request.Ref,
+			HeadCommit: headCommit,
 			BaseRepo:   baseRepo,
 		},
 		Scope: a.Scope,
